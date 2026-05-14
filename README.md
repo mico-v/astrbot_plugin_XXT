@@ -1,6 +1,10 @@
-# astrbot-plugin-helloworld
+# astrbot_plugin_XXT
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+学习通模仿娱乐插件（QQ 群聊向）。
+
+## 已实现功能
+
+- `选人 <人数>`：读取当前 QQ 群成员并随机 @ 指定人数。
 
 > [!NOTE]
 > This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.

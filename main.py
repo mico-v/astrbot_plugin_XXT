@@ -1,8 +1,12 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+import random
+import re
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import At, Plain
+from astrbot.api.star import Context, Star, register
+
+
+@register("xxt_fun", "mico-v", "学习通模仿娱乐插件", "1.0.0")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -10,15 +14,44 @@ class MyPlugin(Star):
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+    @filter.command("选人")
+    async def pick_members(self, event: AstrMessageEvent):
+        """随机@QQ群成员。用法：/选人 人数"""
+        if not event.get_group_id():
+            yield event.plain_result("该指令仅支持群聊使用。")
+            return
+
+        match = re.search(r"(\d+)", event.message_str or "")
+        if not match:
+            yield event.plain_result("用法：/选人 人数，例如 /选人 3")
+            return
+
+        pick_count = int(match.group(1))
+        if pick_count <= 0:
+            yield event.plain_result("人数必须大于 0。")
+            return
+
+        group = await event.get_group()
+        if not group or not group.members:
+            yield event.plain_result("读取群成员失败，请确认当前平台为 QQ(OneBot) 并重试。")
+            return
+
+        bot_self_id = event.get_self_id()
+        members = [m for m in group.members if str(m.user_id) != str(bot_self_id)]
+        if not members:
+            yield event.plain_result("群成员列表为空，无法选人。")
+            return
+        if pick_count > len(members):
+            yield event.plain_result(f"人数过多，当前可选成员共 {len(members)} 人。")
+            return
+
+        selected = random.sample(members, pick_count)
+        chain = [Plain("随机选中：")]
+        for idx, member in enumerate(selected):
+            chain.append(At(qq=str(member.user_id)))
+            if idx < pick_count - 1:
+                chain.append(Plain(" "))
+        yield event.chain_result(chain)
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
