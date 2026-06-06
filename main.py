@@ -1,4 +1,5 @@
 import copy
+import asyncio
 import time
 from collections import OrderedDict
 import random
@@ -13,15 +14,47 @@ MESSAGE_CACHE_TTL_SECONDS = 120
 MAX_MESSAGE_CACHE_SIZE = 500
 MAX_RECALLED_RECORDS = 50
 MAX_QUERY_COUNT = 10
+CLASS_REMINDER_DEFAULT_CONFIG = {
+    "enabled": False,
+    "class_periods": [],
+    "warning_cooldown_seconds": 60,
+    "mention_reply_timeout_seconds": 60,
+}
 
 
-@register("xxt_fun", "mico-v", "学习通模仿娱乐插件", "1.2.0")
+@register("xxt_fun", "mico-v", "学习通模仿娱乐插件", "1.3.4")
 class MyPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
+        self.config = config or {}
         self._recent_messages = OrderedDict()
         self._recalled_messages = []
         self._next_recalled_record_id = 1
+        self._class_reminder_enabled = bool(
+            self.config.get("class_reminder_enabled", CLASS_REMINDER_DEFAULT_CONFIG["enabled"])
+        )
+        self._class_periods = self._normalize_class_periods(
+            self.config.get(
+                "class_periods",
+                CLASS_REMINDER_DEFAULT_CONFIG["class_periods"],
+            )
+        )
+        self._class_warning_cooldown = self._int_or_default(
+            self.config.get(
+                "class_warning_cooldown_seconds",
+                CLASS_REMINDER_DEFAULT_CONFIG["warning_cooldown_seconds"],
+            ),
+            CLASS_REMINDER_DEFAULT_CONFIG["warning_cooldown_seconds"],
+        )
+        self._class_reply_timeout = self._int_or_default(
+            self.config.get(
+                "class_reminder_reply_timeout_seconds",
+                CLASS_REMINDER_DEFAULT_CONFIG["mention_reply_timeout_seconds"],
+            ),
+            CLASS_REMINDER_DEFAULT_CONFIG["mention_reply_timeout_seconds"],
+        )
+        self._class_warning_last_at = {}
+        self._class_mention_pending = {}
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
@@ -38,6 +71,43 @@ class MyPlugin(Star):
 
         if self._is_cacheable_message(event, raw):
             await self._cache_message(event, raw)
+            await self._handle_class_reminder(event, raw)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("课堂提醒")
+    async def toggle_class_reminder(self, event: AstrMessageEvent):
+        """管理员设置课堂提醒开关。用法：/课堂提醒 开/关/状态"""
+        raw_arg = (event.message_str or "").strip().lower()
+        if raw_arg in ("开", "开启", "on", "true", "启用", "enable", "1", "打开"):
+            self._class_reminder_enabled = True
+            self._class_periods = self._normalize_class_periods(
+                self.config.get(
+                    "class_periods",
+                    CLASS_REMINDER_DEFAULT_CONFIG["class_periods"],
+                )
+            )
+            yield event.plain_result("课堂提醒已开启。")
+            return
+        if raw_arg in ("关", "关闭", "off", "false", "停用", "disable", "0", "关闭功能"):
+            self._class_reminder_enabled = False
+            for record in list(self._class_mention_pending.values()):
+                task = record.get("task")
+                if task:
+                    task.cancel()
+            self._class_mention_pending.clear()
+            self._class_warning_last_at.clear()
+            yield event.plain_result("课堂提醒已关闭。")
+            return
+        if raw_arg in ("状态", "", "查看", "status", "check"):
+            yield event.plain_result(
+                "课堂提醒当前{}。".format(
+                    "开启" if self._class_reminder_enabled else "关闭"
+                )
+            )
+            return
+        yield event.plain_result(
+            "用法：/课堂提醒 开|关|状态。开启后会在上课时段内提醒发言与@未及时回应。"
+        )
 
     @filter.command("选人")
     async def pick_members(self, event: AstrMessageEvent):
@@ -90,13 +160,16 @@ class MyPlugin(Star):
             yield event.plain_result("查询数量必须大于 0。")
             return
 
-        records = self._filter_recalled_records(event)[-min(count, MAX_QUERY_COUNT):]
-        if not records:
+        filtered_records = self._filter_recalled_records(event)
+        if not filtered_records:
             yield event.plain_result(
                 "暂无已记录的撤回消息。仅能记录插件收到后两分钟内被撤回的消息。"
             )
             return
 
+        records = list(
+            reversed(filtered_records[-min(count, MAX_QUERY_COUNT):])
+        )
         yield event.chain_result(self._build_recalled_message_chain(records))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -208,6 +281,290 @@ class MyPlugin(Star):
         message_chain = getattr(message_obj, "message", None) or []
         message_str = getattr(message_obj, "message_str", "") or ""
         return bool(message_chain or message_str)
+
+    def _is_class_reminder_enabled(self):
+        return bool(self._class_reminder_enabled)
+
+    async def _handle_class_reminder(self, event, raw):
+        group_id = self._normalize_id(event.get_group_id())
+        if not group_id:
+            return
+
+        sender_id = self._get_sender_id(event, raw)
+        if not sender_id:
+            return
+
+        bot_id = self._normalize_id(event.get_self_id())
+        if bot_id and sender_id == bot_id:
+            return
+
+        await self._mark_target_replied(group_id, sender_id)
+
+        if not self._is_class_reminder_enabled():
+            return
+
+        class_name = self._get_current_class_name()
+        if not class_name:
+            return
+
+        await self._warn_speaker_if_needed(event, group_id, sender_id, class_name)
+
+        mentioned_ids = self._extract_mentioned_user_ids(event, raw)
+        if not mentioned_ids:
+            return
+
+        for target_id in mentioned_ids:
+            if target_id == sender_id:
+                continue
+            await self._schedule_or_refresh_mention_reminder(
+                event, group_id, sender_id, target_id, class_name
+            )
+
+    def _get_sender_id(self, event, raw):
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None)
+        sender_id = self._normalize_id(
+            getattr(sender, "user_id", "") or self._raw_get(raw, "user_id")
+        )
+        if not sender_id and isinstance(self._raw_get(raw, "sender"), dict):
+            sender_id = self._normalize_id(self._raw_get(raw, "sender").get("user_id"))
+        return sender_id
+
+    async def _mark_target_replied(self, group_id, sender_id):
+        for key, record in list(self._class_mention_pending.items()):
+            pending_group_id = self._normalize_id(key[0])
+            pending_target_id = self._normalize_id(key[1])
+            if group_id != pending_group_id or sender_id != pending_target_id:
+                continue
+
+            task = record.get("task")
+            if task:
+                task.cancel()
+            self._class_mention_pending.pop(key, None)
+
+    def _warn_speaker_if_needed(self, event, group_id, sender_id, class_name):
+        last_at = self._class_warning_last_at.get((group_id, sender_id), 0)
+        now = time.time()
+        cooldown = max(1, self._class_warning_cooldown)
+        if now - last_at < cooldown:
+            return
+
+        self._class_warning_last_at[(group_id, sender_id)] = now
+        message = [
+            At(qq=str(sender_id)),
+            Plain(f"现在是 {class_name} 上课时间，请先上课好好听讲。"),
+        ]
+        asyncio.create_task(
+            self._safe_send(event, group_id, message)
+        )
+
+    async def _schedule_or_refresh_mention_reminder(
+        self, event, group_id, mentioner_id, target_id, class_name
+    ):
+        key = (group_id, target_id, mentioner_id)
+        if not target_id or target_id == "all":
+            return
+        if not event or not getattr(event, "bot", None):
+            return
+
+        existing = self._class_mention_pending.get(key)
+        if existing and existing.get("task"):
+            existing["task"].cancel()
+
+        task = asyncio.create_task(
+            self._send_late_reply_reminder(
+                group_id,
+                mentioner_id,
+                target_id,
+                class_name,
+                event.bot,
+            )
+        )
+        self._class_mention_pending[key] = {
+            "task": task,
+            "group_id": group_id,
+            "mentioner_id": mentioner_id,
+            "target_id": target_id,
+            "class_name": class_name,
+            "created_at": time.time(),
+        }
+
+    async def _send_late_reply_reminder(
+        self, group_id, mentioner_id, target_id, class_name, bot
+    ):
+        try:
+            await asyncio.sleep(self._class_reply_timeout)
+        except asyncio.CancelledError:
+            return
+
+        key = (group_id, target_id, mentioner_id)
+        record = self._class_mention_pending.pop(key, None)
+        if record is None:
+            return
+
+        if not self._is_class_reminder_enabled():
+            return
+
+        await self._send_group_message(
+            bot,
+            group_id,
+            [
+                At(qq=str(mentioner_id)),
+                Plain("对方 "),
+                At(qq=str(target_id)),
+                Plain(f" 当前未回复，正在上课：{class_name}，先好好听讲。"),
+            ],
+        )
+
+    def _extract_mentioned_user_ids(self, event, raw):
+        mentioned = []
+        seen = set()
+        message_obj = getattr(event, "message_obj", None)
+        message_segments = getattr(message_obj, "message", None)
+
+        for segment in self._iter_onebot_segments(message_segments):
+            at_id = self._extract_at_id(segment)
+            if not at_id:
+                continue
+            if at_id not in seen:
+                seen.add(at_id)
+                mentioned.append(at_id)
+
+        raw_message = self._raw_get(raw, "message")
+        for segment in self._iter_onebot_segments(raw_message):
+            at_id = self._extract_at_id(segment)
+            if not at_id:
+                continue
+            if at_id not in seen:
+                seen.add(at_id)
+                mentioned.append(at_id)
+
+        message_str = self._raw_get(raw, "message_str", "")
+        message_obj_str = getattr(message_obj, "message_str", None)
+        if message_obj_str:
+            message_str = message_obj_str
+        if message_str:
+            for at_id in re.findall(r"\[CQ:at,qq=([^,\\]]+)", message_str):
+                at_id = self._normalize_id(at_id)
+                if not at_id or at_id == "all":
+                    continue
+                if at_id not in seen:
+                    seen.add(at_id)
+                    mentioned.append(at_id)
+
+        return mentioned
+
+    def _extract_at_id(self, segment):
+        if segment is None:
+            return ""
+
+        if isinstance(segment, dict):
+            if self._segment_type_name(segment.get("type")) != "at":
+                return ""
+            data = segment.get("data", {})
+            if isinstance(data, dict):
+                return self._normalize_id(data.get("qq"))
+            return self._normalize_id(segment.get("qq"))
+
+        segment_type = self._segment_type_name(getattr(segment, "type", ""))
+        if segment_type != "at":
+            return ""
+
+        segment_data = getattr(segment, "data", None)
+        if not isinstance(segment_data, dict):
+            segment_data = {}
+        return self._normalize_id(
+            getattr(segment, "qq", None)
+            or getattr(segment, "user_id", None)
+            or segment_data.get("qq")
+        )
+
+    def _normalize_class_periods(self, periods):
+        if isinstance(periods, str):
+            periods = [periods]
+        if not isinstance(periods, (list, tuple)):
+            return []
+
+        parsed_periods = []
+        for item in periods:
+            normalized = self._normalize_single_class_period(item)
+            if normalized:
+                parsed_periods.append(normalized)
+        return parsed_periods
+
+    def _normalize_single_class_period(self, period):
+        if isinstance(period, dict):
+            start = self._parse_time_to_minutes(period.get("start"))
+            end = self._parse_time_to_minutes(period.get("end"))
+            name = self._normalize_id(period.get("name")) or "课程"
+            if start is None or end is None:
+                return None
+            return {
+                "name": name,
+                "start_minute": start,
+                "end_minute": end,
+            }
+
+        if not isinstance(period, str):
+            return None
+
+        match = re.match(
+            r"^\s*(\d{1,2}:\d{2})\s*[-—~]\s*(\d{1,2}:\d{2})(?:\s*[:：]\s*(.+))?\s*$",
+            period,
+        )
+        if not match:
+            return None
+        start = self._parse_time_to_minutes(match.group(1))
+        end = self._parse_time_to_minutes(match.group(2))
+        if start is None or end is None:
+            return None
+        name = self._normalize_id(match.group(3)) or "课程"
+        return {
+            "name": name,
+            "start_minute": start,
+            "end_minute": end,
+        }
+
+    def _parse_time_to_minutes(self, value):
+        value = self._normalize_id(value)
+        if not value:
+            return None
+        match = re.match(r"^(\d{1,2}):(\d{1,2})$", value)
+        if not match:
+            return None
+        try:
+            hour = int(match.group(1))
+            minute = int(match.group(2))
+        except (TypeError, ValueError):
+            return None
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            return None
+        return hour * 60 + minute
+
+    def _get_current_class_name(self):
+        now = time.localtime()
+        current_minute = now.tm_hour * 60 + now.tm_min
+        for period in self._class_periods:
+            start = period.get("start_minute", -1)
+            end = period.get("end_minute", -1)
+            if start < 0 or end < 0:
+                continue
+            if start < end:
+                if start <= current_minute < end:
+                    return period.get("name") or "课程"
+            else:
+                if current_minute >= start or current_minute < end:
+                    return period.get("name") or "课程"
+        return ""
+
+    def _segment_type_name(self, segment_type):
+        if segment_type is None:
+            return ""
+        if isinstance(segment_type, str):
+            return segment_type.lower()
+        if hasattr(segment_type, "value"):
+            return str(segment_type.value).lower()
+        return self._normalize_id(segment_type).lower()
 
     def _get_message_id(self, message_obj, raw):
         raw_message_id = self._raw_get(raw, "message_id")
@@ -343,12 +700,12 @@ class MyPlugin(Star):
 
     def _build_recalled_message_chain(self, records):
         lines = ["最近记录的撤回消息："]
-        for record in records:
+        for index, record in enumerate(records, start=1):
             sent_at = self._format_timestamp(record.get("time"))
             sender = record.get("sender_name") or record.get("sender_id") or "未知用户"
             lines.append(
                 "#{} {} {}({})".format(
-                    record.get("record_id") or "?",
+                    index,
                     sent_at,
                     sender,
                     record.get("sender_id") or "未知",
@@ -375,7 +732,13 @@ class MyPlugin(Star):
 
     def _find_recalled_record(self, event, record_id):
         normalized_record_id = self._normalize_id(record_id)
-        for record in self._filter_recalled_records(event):
+        ordered_records = list(reversed(self._filter_recalled_records(event)))
+
+        for index, record in enumerate(ordered_records, start=1):
+            if self._normalize_id(index) == normalized_record_id:
+                return record
+
+        for record in ordered_records:
             if self._normalize_id(record.get("record_id")) == normalized_record_id:
                 return record
         return None
@@ -439,16 +802,23 @@ class MyPlugin(Star):
     def _iter_onebot_segments(self, message):
         if isinstance(message, list):
             for segment in message:
-                if isinstance(segment, dict):
-                    yield segment
+                yield segment
         elif isinstance(message, dict):
             yield message
+        elif isinstance(message, tuple):
+            for segment in message:
+                yield segment
+        elif hasattr(message, "__iter__") and not isinstance(message, (str, bytes)):
+            for segment in message:
+                yield segment
 
     def _is_forward_segment(self, segment):
-        return self._normalize_id(segment.get("type")).lower() == "forward"
+        return self._segment_type_name(getattr(segment, "type", "")) == "forward"
 
     def _extract_segment_data(self, segment):
-        data = segment.get("data", {})
+        data = getattr(segment, "data", None)
+        if data is None and isinstance(segment, dict):
+            data = segment.get("data", {})
         return data if isinstance(data, dict) else {}
 
     def _record_has_forward(self, record):
@@ -491,19 +861,29 @@ class MyPlugin(Star):
         message_str = record.get("message_str") or ""
         return [Plain(message_str)] if message_str else []
 
-    def _has_onebot_api(self, event):
-        bot = getattr(event, "bot", None)
+    def _resolve_onebot_adapter(self, event_or_bot):
+        if event_or_bot is None:
+            return None
+        if callable(getattr(event_or_bot, "call_action", None)):
+            return event_or_bot
+        return getattr(event_or_bot, "bot", None)
+
+    def _has_onebot_api(self, event_or_bot):
+        bot = self._resolve_onebot_adapter(event_or_bot)
         if bot and callable(getattr(bot, "call_action", None)):
             return True
         api = getattr(bot, "api", None) if bot else None
         return bool(api and callable(getattr(api, "call_action", None)))
 
-    async def _call_onebot_api(self, event, action, **params):
-        bot = getattr(event, "bot", None)
-        if bot and callable(getattr(bot, "call_action", None)):
+    async def _call_onebot_api(self, event_or_bot, action, **params):
+        bot = self._resolve_onebot_adapter(event_or_bot)
+        if not bot:
+            raise RuntimeError("当前 OneBot 适配器没有暴露 call_action。")
+
+        if callable(getattr(bot, "call_action", None)):
             response = await bot.call_action(action, **params)
         else:
-            api = getattr(bot, "api", None) if bot else None
+            api = getattr(bot, "api", None)
             if not api or not callable(getattr(api, "call_action", None)):
                 raise RuntimeError("当前 OneBot 适配器没有暴露 call_action。")
             response = await api.call_action(action, **params)
@@ -533,22 +913,28 @@ class MyPlugin(Star):
         )
         raise RuntimeError(f"{action} 调用失败：{message}")
 
-    async def _send_group_message(self, event, group_id, message):
-        await self._call_onebot_api(
-            event,
+    async def _send_group_message(self, event_or_bot, group_id, message):
+        return await self._call_onebot_api(
+            event_or_bot,
             "send_group_msg",
             group_id=self._onebot_id(group_id),
             message=message,
             auto_escape=False,
         )
 
-    async def _send_group_forward_message(self, event, group_id, nodes):
+    async def _send_group_forward_message(self, event_or_bot, group_id, nodes):
         await self._call_onebot_api(
-            event,
+            event_or_bot,
             "send_group_forward_msg",
             group_id=self._onebot_id(group_id),
             messages=nodes,
         )
+
+    async def _safe_send(self, event_or_bot, group_id, message):
+        try:
+            await self._send_group_message(event_or_bot, group_id, message)
+        except Exception:
+            pass
 
     def _onebot_id(self, value):
         value = self._normalize_id(value)
@@ -734,3 +1120,8 @@ class MyPlugin(Star):
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        for record in list(self._class_mention_pending.values()):
+            task = record.get("task")
+            if task:
+                task.cancel()
+        self._class_mention_pending.clear()
