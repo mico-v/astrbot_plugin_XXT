@@ -6,8 +6,9 @@ import random
 import re
 
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Plain
+from astrbot.api.message_components import At, Plain, Reply
 from astrbot.api.star import Context, Star, register
+from astrbot.core.star.filter.command import GreedyStr
 
 
 MESSAGE_CACHE_TTL_SECONDS = 120
@@ -22,7 +23,7 @@ CLASS_REMINDER_DEFAULT_CONFIG = {
 }
 
 
-@register("xxt_fun", "mico-v", "学习通模仿娱乐插件", "1.3.4")
+@register("xxt_fun", "mico-v", "学习通模仿娱乐插件", "1.3.5")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -58,6 +59,48 @@ class MyPlugin(Star):
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+
+    @filter.command("说")
+    async def say(self, event: AstrMessageEvent, content: GreedyStr):
+        """复述指令后的全部内容。用法：/说 内容"""
+        content = str(content or "").strip()
+        if not content:
+            yield event.plain_result("用法：/说 内容，例如 /说 大家好。")
+            return
+        yield event.plain_result(content)
+
+    @filter.command("撤回")
+    async def recall_message(self, event: AstrMessageEvent):
+        """撤回引用的消息，或机器人最近发送的消息。"""
+        raw = self._get_raw_message(event)
+        target_id = self._get_reply_message_id(event)
+        if not target_id:
+            self._purge_expired_message_cache()
+            current_message_id = self._get_message_id(
+                getattr(event, "message_obj", None), raw
+            )
+            session_id = self._get_session_id(event, raw)
+            target_id = self._find_last_bot_message_id(
+                event,
+                session_id,
+                current_message_id,
+            )
+
+        if not target_id:
+            yield event.plain_result("没有找到可撤回的机器人消息。")
+            return
+
+        try:
+            await self._call_onebot_api(
+                event,
+                "delete_msg",
+                message_id=self._onebot_id(target_id),
+            )
+        except Exception as exc:
+            yield event.plain_result(f"撤回失败：{exc}")
+            return
+
+        yield event.plain_result(f"已撤回消息 #{target_id}。")
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def anti_recall_watcher(self, event: AstrMessageEvent):
@@ -566,11 +609,52 @@ class MyPlugin(Star):
             return str(segment_type.value).lower()
         return self._normalize_id(segment_type).lower()
 
-    def _get_message_id(self, message_obj, raw):
-        raw_message_id = self._raw_get(raw, "message_id")
-        if raw_message_id is not None:
-            return self._normalize_id(raw_message_id)
-        return self._normalize_id(getattr(message_obj, "message_id", ""))
+    def _get_reply_message_id(self, event):
+        message_segments = []
+        get_messages = getattr(event, "get_messages", None)
+        if callable(get_messages):
+            try:
+                message_segments = get_messages() or []
+            except Exception:
+                message_segments = []
+        if not message_segments:
+            message_segments = getattr(
+                getattr(event, "message_obj", None), "message", None
+            ) or []
+
+        for segment in self._iter_onebot_segments(message_segments):
+            if isinstance(segment, Reply):
+                reply_id = getattr(segment, "id", None)
+            elif isinstance(segment, dict):
+                if self._segment_type_name(segment.get("type")) != "reply":
+                    continue
+                data = segment.get("data") or {}
+                reply_id = data.get("id") if isinstance(data, dict) else None
+            else:
+                if self._segment_type_name(getattr(segment, "type", "")) != "reply":
+                    continue
+                reply_id = getattr(segment, "id", None)
+            reply_id = self._normalize_id(reply_id)
+            if reply_id:
+                return reply_id
+        return ""
+
+    def _find_last_bot_message_id(self, event, session_id, current_message_id):
+        bot_id = self._normalize_id(event.get_self_id())
+        if not bot_id or not session_id:
+            return ""
+
+        for record in reversed(list(self._recent_messages.values())):
+            if record.get("session_id") != session_id:
+                continue
+            if self._normalize_id(record.get("message_id")) == current_message_id:
+                continue
+            if self._normalize_id(record.get("sender_id")) != bot_id:
+                continue
+            message_id = self._normalize_id(record.get("message_id"))
+            if message_id:
+                return message_id
+        return ""
 
     def _get_session_id(self, event, raw):
         group_id = self._normalize_id(self._raw_get(raw, "group_id"))

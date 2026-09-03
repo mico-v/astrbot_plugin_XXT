@@ -1,6 +1,6 @@
 name: xxt_fun # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
 display_name: 学习通模仿娱乐插件 # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
-desc: QQ群学习通模仿娱乐插件，提供随机选人、防撤回查询与课堂提醒。 # 插件简短描述
-version: v1.3.4 # 插件版本号。格式：v1.1.1 或者 v1.1
+desc: QQ群学习通模仿娱乐插件，提供随机选人、防撤回查询、消息撤回、复述与课堂提醒。 # 插件简短描述
+version: v1.3.5 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: mico-v # 作者
 repo: https://github.com/mico-v/astrbot_plugin_XXT # 插件的仓库地址
