@@ -609,6 +609,12 @@ class MyPlugin(Star):
             return str(segment_type.value).lower()
         return self._normalize_id(segment_type).lower()
 
+    def _get_message_id(self, message_obj, raw):
+        raw_message_id = self._raw_get(raw, "message_id")
+        if raw_message_id is not None:
+            return self._normalize_id(raw_message_id)
+        return self._normalize_id(getattr(message_obj, "message_id", ""))
+
     def _get_reply_message_id(self, event):
         message_segments = []
         get_messages = getattr(event, "get_messages", None)
